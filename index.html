@@ -300,8 +300,6 @@ let session = {
   ratings: {},
   synced: {},   // { qid: { at: ISO, dirty: bool } } — tracks which questions have been sent to the server
 };
-const _syncTimers = {};          // per-qid debounce timer ids
-const SYNC_DEBOUNCE_MS = 1200;   // wait this long after last edit before POSTing
 
 async function loadData() {
   try {
@@ -428,33 +426,27 @@ async function syncQuestionNow(qid) {
   }
 }
 
-function scheduleSync(qid) {
-  // Debounce: cancel any pending timer for this qid, schedule a new one.
+function refreshSyncBadge(qid) {
+  // Just update the little status pill to reflect the current state.
+  const s = session.synced?.[qid];
   if (!isQuestionFullyRated(qid)) {
-    // Mark dirty so a previously-synced question that's been edited gets resent later.
-    if (session.synced && session.synced[qid]) session.synced[qid].dirty = true;
-    setSyncStatus("idle", "not yet saved");
-    return;
+    setSyncStatus("idle", "rate all 3 to enable save");
+  } else if (s && !s.dirty) {
+    const hhmm = s.at ? new Date(s.at).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : "";
+    setSyncStatus("saved", `saved ${hhmm}`);
+  } else {
+    setSyncStatus("idle", "unsaved — click Next to save");
   }
-  if (_syncTimers[qid]) clearTimeout(_syncTimers[qid]);
-  _syncTimers[qid] = setTimeout(() => {
-    delete _syncTimers[qid];
-    syncQuestionNow(qid);
-  }, SYNC_DEBOUNCE_MS);
-  setSyncStatus("saving", "saving shortly…");
 }
 
-async function flushPending(qid) {
-  // If a debounce timer is pending for this qid, fire immediately.
-  if (_syncTimers[qid]) {
-    clearTimeout(_syncTimers[qid]);
-    delete _syncTimers[qid];
-  }
-  // Also catch questions that were synced then edited (dirty).
+async function saveCurrentQuestion(qid) {
+  // Called when the user clicks Next or Prev. Only POST if fully rated
+  // and either never-synced or dirty since last sync.
+  if (!isQuestionFullyRated(qid)) return true;  // nothing to save, allow nav
   const s = session.synced?.[qid];
-  if (isQuestionFullyRated(qid) && (!s || s.dirty)) {
-    await syncQuestionNow(qid);
-  }
+  if (s && !s.dirty) return true;               // already saved, allow nav
+  await syncQuestionNow(qid);
+  return true;
 }
 
 function renderQuestion(idx) {
@@ -472,16 +464,7 @@ function renderQuestion(idx) {
   document.getElementById("rated-count").textContent = countFullyRatedQuestions();
   document.getElementById("progress-fill").style.width =
     ((idx + 1) / allQuestions.length * 100) + "%";
-  // Reflect the save state for this question in the status badge
-  const s = session.synced?.[q.question_id];
-  if (s && !s.dirty) {
-    const hhmm = s.at ? new Date(s.at).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : "";
-    setSyncStatus("saved", `saved ${hhmm}`);
-  } else if (isQuestionFullyRated(q.question_id)) {
-    setSyncStatus("saving", "queued to save");
-  } else {
-    setSyncStatus("idle", "not yet saved");
-  }
+  refreshSyncBadge(q.question_id);
 
   const mapping = getOrCreateMapping(q.question_id);
   const container = document.getElementById("answers-container");
@@ -543,7 +526,7 @@ function renderQuestion(idx) {
         // Mark already-synced question as dirty if user changed a rating.
         if (session.synced && session.synced[q.question_id]) session.synced[q.question_id].dirty = true;
         saveSession();
-        scheduleSync(q.question_id);
+        refreshSyncBadge(q.question_id);
       });
     });
   });
@@ -556,14 +539,14 @@ function renderQuestion(idx) {
       session.ratings[q.question_id][letter].comment = ta.value;
       if (session.synced && session.synced[q.question_id]) session.synced[q.question_id].dirty = true;
       saveSession();
-      scheduleSync(q.question_id);
+      refreshSyncBadge(q.question_id);
     });
   });
 }
 
 async function next() {
   const currentQid = allQuestions[currentIdx]?.question_id;
-  if (currentQid) await flushPending(currentQid);
+  if (currentQid) await saveCurrentQuestion(currentQid);
   if (currentIdx < allQuestions.length - 1) {
     renderQuestion(currentIdx + 1);
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -571,7 +554,7 @@ async function next() {
 }
 async function prev() {
   const currentQid = allQuestions[currentIdx]?.question_id;
-  if (currentQid) await flushPending(currentQid);
+  if (currentQid) await saveCurrentQuestion(currentQid);
   if (currentIdx > 0) {
     renderQuestion(currentIdx - 1);
     window.scrollTo({ top: 0, behavior: "smooth" });
