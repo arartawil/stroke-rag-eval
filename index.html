@@ -126,6 +126,11 @@
   .progress-bar { background: #e5e7eb; border-radius: 999px; height: 8px; overflow: hidden; margin: 12px 0 4px; }
   .progress-fill { background: linear-gradient(90deg, var(--primary), var(--accent)); height: 100%; transition: width 0.4s; }
   .progress-text { font-size: 13px; color: var(--muted); text-align: center; margin-bottom: 16px; }
+  .sync-status { display: inline-block; margin-left: 10px; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; vertical-align: middle; transition: background 0.3s, color 0.3s; }
+  .sync-status.idle    { background: #f3f4f6; color: #6b7280; }
+  .sync-status.saving  { background: #fef3c7; color: #92400e; }
+  .sync-status.saved   { background: #d1fae5; color: #065f46; }
+  .sync-status.error   { background: #fee2e2; color: #991b1b; }
 
   .nav-buttons { display: flex; justify-content: space-between; gap: 12px; margin-top: 24px; }
   .hidden { display: none !important; }
@@ -216,7 +221,7 @@
     <div class="progress-bar">
       <div id="progress-fill" class="progress-fill" style="width: 0%;"></div>
     </div>
-    <div class="progress-text">Question <span id="current-q">1</span> of <span id="total-q">N</span> — Fully rated: <span id="rated-count">0</span></div>
+    <div class="progress-text">Question <span id="current-q">1</span> of <span id="total-q">N</span> — Fully rated: <span id="rated-count">0</span><span id="sync-status" class="sync-status idle">not yet saved</span></div>
 
     <div class="card">
       <div class="meta">
@@ -293,7 +298,10 @@ let session = {
   doctor: { name: "", email: "", specialty: "", experience: "" },
   startTime: null,
   ratings: {},
+  synced: {},   // { qid: { at: ISO, dirty: bool } } — tracks which questions have been sent to the server
 };
+const _syncTimers = {};          // per-qid debounce timer ids
+const SYNC_DEBOUNCE_MS = 1200;   // wait this long after last edit before POSTing
 
 async function loadData() {
   try {
@@ -352,6 +360,103 @@ function countFullyRatedQuestions() {
   ).length;
 }
 
+function isQuestionFullyRated(qid) {
+  return ["A", "B", "C"].every(l => isFullyRated(qid, l));
+}
+
+function setSyncStatus(state, text) {
+  const el = document.getElementById("sync-status");
+  if (!el) return;
+  el.className = "sync-status " + state;
+  el.textContent = text;
+}
+
+function rowsForQuestion(q) {
+  // Build the same row shape the final Submit flow uses, for a single question.
+  const r = session.ratings[q.question_id];
+  if (!r || !r.mapping) return [];
+  const rows = [];
+  for (const letter of ["A","B","C"]) {
+    const rating = r[letter] || {};
+    const row = {
+      question_id: q.question_id,
+      topic: q.topic,
+      difficulty: q.difficulty,
+      session_history: q.session_history,
+      system_letter: letter,
+      system_actual: r.mapping[letter],
+      comment: rating.comment || "",
+    };
+    RATING_DIMENSIONS.forEach(d => row[d] = rating[d] || "");
+    rows.push(row);
+  }
+  return rows;
+}
+
+async function syncQuestionNow(qid) {
+  // POST a single question's 3 rows to the Apps Script endpoint immediately.
+  if (APPS_SCRIPT_URL.startsWith("PASTE_")) return;    // not configured — skip silently
+  if (!isQuestionFullyRated(qid)) return;
+  const q = allQuestions.find(x => x.question_id === qid);
+  if (!q) return;
+  const rows = rowsForQuestion(q);
+  if (rows.length === 0) return;
+
+  setSyncStatus("saving", `saving ${qid}…`);
+  const payload = {
+    doctor: session.doctor,
+    startTime: session.startTime,
+    submitTime: new Date().toISOString(),
+    partial: true,
+    question_id: qid,
+    ratings: rows,
+  };
+  try {
+    await fetch(APPS_SCRIPT_URL, {
+      method: "POST", mode: "no-cors",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(payload),
+    });
+    if (!session.synced) session.synced = {};
+    session.synced[qid] = { at: new Date().toISOString(), dirty: false };
+    saveSession();
+    const total = countFullyRatedQuestions();
+    const saved = Object.values(session.synced || {}).filter(s => !s.dirty).length;
+    setSyncStatus("saved", `saved (${saved}/${total})`);
+  } catch (e) {
+    setSyncStatus("error", "save failed — will retry");
+  }
+}
+
+function scheduleSync(qid) {
+  // Debounce: cancel any pending timer for this qid, schedule a new one.
+  if (!isQuestionFullyRated(qid)) {
+    // Mark dirty so a previously-synced question that's been edited gets resent later.
+    if (session.synced && session.synced[qid]) session.synced[qid].dirty = true;
+    setSyncStatus("idle", "not yet saved");
+    return;
+  }
+  if (_syncTimers[qid]) clearTimeout(_syncTimers[qid]);
+  _syncTimers[qid] = setTimeout(() => {
+    delete _syncTimers[qid];
+    syncQuestionNow(qid);
+  }, SYNC_DEBOUNCE_MS);
+  setSyncStatus("saving", "saving shortly…");
+}
+
+async function flushPending(qid) {
+  // If a debounce timer is pending for this qid, fire immediately.
+  if (_syncTimers[qid]) {
+    clearTimeout(_syncTimers[qid]);
+    delete _syncTimers[qid];
+  }
+  // Also catch questions that were synced then edited (dirty).
+  const s = session.synced?.[qid];
+  if (isQuestionFullyRated(qid) && (!s || s.dirty)) {
+    await syncQuestionNow(qid);
+  }
+}
+
 function renderQuestion(idx) {
   if (idx < 0 || idx >= allQuestions.length) return;
   const q = allQuestions[idx];
@@ -367,6 +472,16 @@ function renderQuestion(idx) {
   document.getElementById("rated-count").textContent = countFullyRatedQuestions();
   document.getElementById("progress-fill").style.width =
     ((idx + 1) / allQuestions.length * 100) + "%";
+  // Reflect the save state for this question in the status badge
+  const s = session.synced?.[q.question_id];
+  if (s && !s.dirty) {
+    const hhmm = s.at ? new Date(s.at).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : "";
+    setSyncStatus("saved", `saved ${hhmm}`);
+  } else if (isQuestionFullyRated(q.question_id)) {
+    setSyncStatus("saving", "queued to save");
+  } else {
+    setSyncStatus("idle", "not yet saved");
+  }
 
   const mapping = getOrCreateMapping(q.question_id);
   const container = document.getElementById("answers-container");
@@ -425,7 +540,10 @@ function renderQuestion(idx) {
         const card = btn.closest(".answer-card");
         card.classList.toggle("rated", isFullyRated(q.question_id, letter));
         document.getElementById("rated-count").textContent = countFullyRatedQuestions();
+        // Mark already-synced question as dirty if user changed a rating.
+        if (session.synced && session.synced[q.question_id]) session.synced[q.question_id].dirty = true;
         saveSession();
+        scheduleSync(q.question_id);
       });
     });
   });
@@ -436,18 +554,24 @@ function renderQuestion(idx) {
       if (!session.ratings[q.question_id]) session.ratings[q.question_id] = {};
       if (!session.ratings[q.question_id][letter]) session.ratings[q.question_id][letter] = {};
       session.ratings[q.question_id][letter].comment = ta.value;
+      if (session.synced && session.synced[q.question_id]) session.synced[q.question_id].dirty = true;
       saveSession();
+      scheduleSync(q.question_id);
     });
   });
 }
 
-function next() {
+async function next() {
+  const currentQid = allQuestions[currentIdx]?.question_id;
+  if (currentQid) await flushPending(currentQid);
   if (currentIdx < allQuestions.length - 1) {
     renderQuestion(currentIdx + 1);
     window.scrollTo({ top: 0, behavior: "smooth" });
   } else { finish(); }
 }
-function prev() {
+async function prev() {
+  const currentQid = allQuestions[currentIdx]?.question_id;
+  if (currentQid) await flushPending(currentQid);
   if (currentIdx > 0) {
     renderQuestion(currentIdx - 1);
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -601,6 +725,7 @@ document.getElementById("restart-btn").addEventListener("click", () => {
   const saved = loadSession();
   if (saved && saved.doctor && saved.doctor.name) {
     session = saved;
+    if (!session.synced) session.synced = {};   // back-fill for sessions started before auto-save was added
     const rated = countFullyRatedQuestions();
     document.getElementById("doctor-name").value = session.doctor.name;
     document.getElementById("doctor-email").value = session.doctor.email;
