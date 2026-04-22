@@ -76,26 +76,51 @@ function doGet(e) {
     .setMimeType(ContentService.MimeType.TEXT);
 }
 
+const HEADERS = [
+  "submit_time", "start_time", "doctor_name", "doctor_email",
+  "specialty", "experience_years",
+  "question_id", "topic", "difficulty", "session_history",
+  "system_letter", "system_actual",
+  "accuracy", "completeness", "citations", "safety", "image_quality",
+  "comment",
+];
+
 function getOrCreateSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName("Ratings");
   if (!sheet) {
     sheet = ss.insertSheet("Ratings");
-    const headers = [
-      "submit_time", "start_time", "doctor_name", "doctor_email",
-      "specialty", "experience_years",
-      "question_id", "topic", "difficulty", "session_history",
-      "system_letter", "system_actual",
-      "accuracy", "completeness", "citations", "safety", "image_quality",
-      "comment",
-    ];
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    sheet.getRange(1, 1, 1, headers.length)
-         .setFontWeight("bold")
-         .setBackground("#6b21a8")
-         .setFontColor("white");
-    sheet.setFrozenRows(1);
-    sheet.autoResizeColumns(1, headers.length);
   }
+  ensureHeaders(sheet);
   return sheet;
+}
+
+function ensureHeaders(sheet) {
+  // Write headers if row 1 is empty or if the first cell isn't our header name.
+  const firstCell = sheet.getRange(1, 1).getValue();
+  const needHeaders = !firstCell || String(firstCell).trim() !== HEADERS[0];
+  if (!needHeaders) return;
+
+  sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
+  sheet.getRange(1, 1, 1, HEADERS.length)
+       .setFontWeight("bold")
+       .setBackground("#6b21a8")
+       .setFontColor("white");
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, HEADERS.length);
+}
+
+/**
+ * Manual utility: run this once from the Apps Script editor (Run > installHeaders)
+ * to force the header row into the current sheet even if it already has data.
+ */
+function installHeaders() {
+  const sheet = getOrCreateSheet();
+  sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
+  sheet.getRange(1, 1, 1, HEADERS.length)
+       .setFontWeight("bold")
+       .setBackground("#6b21a8")
+       .setFontColor("white");
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, HEADERS.length);
 }
